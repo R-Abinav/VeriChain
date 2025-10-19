@@ -17,7 +17,6 @@ contract FactCheckRegistry{
 		bool finalized;
 	}
 
-
 	struct Stake{
 		address staker;
 		uint256 amount;
@@ -98,6 +97,7 @@ contract FactCheckRegistry{
 		require(_id < factCheckCount, "Invalid fact check ID");
 		require(!factChecks[_id].finalized, "Fact check already finalized");
 		require(_amount > 0, "Stake amount must be greater than 0");
+		require(msg.sender != factChecks[_id].submittedBy, "Cannot stake on your own claim");
 
 		stakes[_id].push(Stake({
 			staker: msg.sender,

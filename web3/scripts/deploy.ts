@@ -2,7 +2,7 @@ import { ethers } from "ethers";
 import hre from "hardhat";
 
 async function main() {
-  console.log("🚀 Deploying FactCheckDAO to Sepolia...\n");
+  console.log("🚀 Deploying VeriChain to Sepolia...\n");
 
   // Deploy FactCheckRegistry
   console.log("📝 Deploying FactCheckRegistry...");

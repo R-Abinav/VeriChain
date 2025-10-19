@@ -5,7 +5,7 @@ import { AnalysisResponse } from "../types/index.js";
 const genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
 
 export class GeminiService {
-  private model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+  private model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
 
   async analyzeClaim(claim: string): Promise<AnalysisResponse> {
     try {

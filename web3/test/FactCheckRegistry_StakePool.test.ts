@@ -6,16 +6,17 @@ import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
 // Use any type for contracts until TypeChain types are generated
 type Contract = any;
 
-describe("VeriChain", () => {
+describe("VeriChain - Complete Test Suite", () => {
   let registry: Contract;
   let stakePool: Contract;
   let owner: SignerWithAddress;
   let alice: SignerWithAddress;
   let bob: SignerWithAddress;
+  let charlie: SignerWithAddress;
 
   beforeEach(async () => {
     // Get signers
-    [owner, alice, bob] = await hre.ethers.getSigners();
+    [owner, alice, bob, charlie] = await hre.ethers.getSigners();
 
     // Deploy FactCheckRegistry
     const FactCheckRegistry = await hre.ethers.getContractFactory("FactCheckRegistry");
@@ -26,7 +27,7 @@ describe("VeriChain", () => {
     stakePool = await StakePool.deploy(await registry.getAddress());
   });
 
-  describe("FactCheckRegistry", () => {
+  describe("FactCheckRegistry - Basic Functions", () => {
     it("Should submit a fact check", async () => {
       const claim = "The Earth is flat";
       const analysis = "AI says: This is FALSE based on 1000+ sources";
@@ -59,55 +60,84 @@ describe("VeriChain", () => {
       ).to.be.revertedWith("Claim cannot be empty");
     });
 
-    it("Should add stakes to a fact check", async () => {
-      // Submit a claim
-      await registry.submitFactCheck("Biden won 2020", "AI analysis", 90);
+    it("Should track submittedBy correctly", async () => {
+      const claim = "Bitcoin was created in 2009";
+      await registry.connect(alice).submitFactCheck(claim, "AI analysis", 92);
 
-      // Alice stakes 10 for TRUE
-      await registry.connect(alice).addStake(0, true, ethers.parseEther("10"));
+      const factCheck = await registry.getFactCheck(0);
+      expect(factCheck.submittedBy).to.equal(alice.address);
+    });
+  });
 
-      // Bob stakes 5 for FALSE
-      await registry.connect(bob).addStake(0, false, ethers.parseEther("5"));
+  describe("FactCheckRegistry - Staking with Anti-Sybil Protection", () => {
+    it("Should prevent user from staking on their own claim", async () => {
+      // Alice submits a claim
+      await registry.connect(alice).submitFactCheck(
+        "Bitcoin was created in 2009",
+        "AI analysis",
+        92
+      );
 
-      // Check fact check was updated
+      // Alice tries to stake on her own claim - should fail
+      await expect(
+        registry.connect(alice).addStake(0, true, ethers.parseEther("1"))
+      ).to.be.revertedWith("Cannot stake on your own claim");
+    });
+
+    it("Should allow other users to stake on the claim", async () => {
+      // Alice submits
+      await registry.connect(alice).submitFactCheck("Claim", "Analysis", 90);
+
+      // Bob stakes for TRUE
+      await registry.connect(bob).addStake(0, true, ethers.parseEther("10"));
+
+      // Charlie stakes for FALSE
+      await registry.connect(charlie).addStake(0, false, ethers.parseEther("5"));
+
       const factCheck = await registry.getFactCheck(0);
       expect(factCheck.stakesFor).to.equal(ethers.parseEther("10"));
       expect(factCheck.stakesAgainst).to.equal(ethers.parseEther("5"));
+    });
 
-      // Check user stakes were recorded
-      const aliceStake = await registry.getUserStakeOnClaim(0, alice.address);
-      expect(aliceStake).to.equal(ethers.parseEther("10"));
+    it("Should track multiple stakes from different users", async () => {
+      await registry.connect(alice).submitFactCheck("Claim", "Analysis", 75);
 
-      // Check stakes array
+      // Bob stakes twice
+      await registry.connect(bob).addStake(0, true, ethers.parseEther("5"));
+      await registry.connect(bob).addStake(0, true, ethers.parseEther("3"));
+
+      const userStake = await registry.getUserStakeOnClaim(0, bob.address);
+      expect(userStake).to.equal(ethers.parseEther("8"));
+
       const stakes = await registry.getStakes(0);
       expect(stakes.length).to.equal(2);
-      expect(stakes[0].staker).to.equal(alice.address);
-      expect(stakes[0].supportVerdict).to.be.true;
-      expect(stakes[1].staker).to.equal(bob.address);
-      expect(stakes[1].supportVerdict).to.be.false;
     });
 
     it("Should not allow staking on finalized claims", async () => {
-      // Submit and finalize
       await registry.submitFactCheck("Test claim", "Test analysis", 75);
       await registry.finalizeVerdict(0);
 
-      // Try to stake (should fail)
       await expect(
         registry.connect(alice).addStake(0, true, ethers.parseEther("5"))
       ).to.be.revertedWith("Fact check already finalized");
     });
 
+    it("Should reject zero stake amount", async () => {
+      await registry.connect(alice).submitFactCheck("Claim", "Analysis", 50);
+
+      await expect(
+        registry.connect(bob).addStake(0, true, ethers.parseEther("0"))
+      ).to.be.revertedWith("Stake amount must be greater than 0");
+    });
+  });
+
+  describe("FactCheckRegistry - Verdict Finalization", () => {
     it("Should finalize verdict: TRUE (AI high confidence + community votes TRUE)", async () => {
-      // Submit claim with 90% confidence
       await registry.submitFactCheck("Claim", "Analysis", 90);
 
-      // Alice stakes 100 for TRUE
       await registry.connect(alice).addStake(0, true, ethers.parseEther("100"));
-      // Bob stakes 10 for FALSE
       await registry.connect(bob).addStake(0, false, ethers.parseEther("10"));
 
-      // Finalize
       await registry.finalizeVerdict(0);
 
       const factCheck = await registry.getFactCheck(0);
@@ -116,15 +146,11 @@ describe("VeriChain", () => {
     });
 
     it("Should finalize verdict: FALSE (AI low confidence + community votes FALSE)", async () => {
-      // Submit claim with 40% confidence
       await registry.submitFactCheck("Claim", "Analysis", 40);
 
-      // Alice stakes 10 for TRUE
       await registry.connect(alice).addStake(0, true, ethers.parseEther("10"));
-      // Bob stakes 100 for FALSE
       await registry.connect(bob).addStake(0, false, ethers.parseEther("100"));
 
-      // Finalize
       await registry.finalizeVerdict(0);
 
       const factCheck = await registry.getFactCheck(0);
@@ -133,20 +159,29 @@ describe("VeriChain", () => {
     });
 
     it("Should finalize verdict: UNCLEAR (conflicting signals)", async () => {
-      // Submit claim with 60% confidence (borderline)
       await registry.submitFactCheck("Claim", "Analysis", 60);
 
-      // Alice stakes 50 for TRUE
       await registry.connect(alice).addStake(0, true, ethers.parseEther("50"));
-      // Bob stakes 60 for FALSE (more stakes for FALSE)
       await registry.connect(bob).addStake(0, false, ethers.parseEther("60"));
 
-      // Finalize
       await registry.finalizeVerdict(0);
 
       const factCheck = await registry.getFactCheck(0);
       expect(factCheck.verdict).to.equal(3); // UNCLEAR
       expect(factCheck.finalized).to.be.true;
+    });
+
+    it("Should finalize verdict: UNCLEAR (stakes too close)", async () => {
+      // Stakes are close (45% vs 55%)
+      await registry.submitFactCheck("Claim", "Analysis", 90); // AI confident
+
+      await registry.connect(alice).addStake(0, true, ethers.parseEther("45"));
+      await registry.connect(bob).addStake(0, false, ethers.parseEther("55"));
+
+      await registry.finalizeVerdict(0);
+
+      const factCheck = await registry.getFactCheck(0);
+      expect(factCheck.verdict).to.equal(3); // UNCLEAR because stakes too close
     });
 
     it("Should only allow owner to finalize", async () => {
@@ -156,9 +191,18 @@ describe("VeriChain", () => {
         registry.connect(alice).finalizeVerdict(0)
       ).to.be.revertedWith("Only owner");
     });
+
+    it("Should prevent double finalization", async () => {
+      await registry.submitFactCheck("Claim", "Analysis", 75);
+      await registry.finalizeVerdict(0);
+
+      await expect(
+        registry.finalizeVerdict(0)
+      ).to.be.revertedWith("Already Finalized");
+    });
   });
 
-  describe("StakePool", () => {
+  describe("StakePool - Deposit & Withdrawal", () => {
     it("Should allow users to deposit ETH", async () => {
       const depositAmount = ethers.parseEther("5");
 
@@ -197,7 +241,7 @@ describe("VeriChain", () => {
       ).to.be.revertedWith("Cannot withdraw locked funds");
     });
 
-    it("Should lock tokens for staking", async () => {
+    it("Should track available and locked balances correctly", async () => {
       const depositAmount = ethers.parseEther("5");
       const lockAmount = ethers.parseEther("3");
 
@@ -210,28 +254,51 @@ describe("VeriChain", () => {
       expect(locked).to.equal(lockAmount);
       expect(available).to.equal(depositAmount - lockAmount);
     });
+  });
 
-    it("Should unlock tokens", async () => {
+  describe("StakePool - Token Locking & Unlocking", () => {
+    it("Should lock tokens for staking", async () => {
       const depositAmount = ethers.parseEther("5");
       const lockAmount = ethers.parseEther("3");
 
       await stakePool.connect(alice).deposit({ value: depositAmount });
       await stakePool.lockTokensForStake(alice.address, lockAmount);
 
-      // Unlock (only registry can call this normally, but owner can too for testing)
+      const locked = await stakePool.getLockedBalance(alice.address);
+      expect(locked).to.equal(lockAmount);
+    });
+
+    it("Should unlock tokens after voting", async () => {
+      const depositAmount = ethers.parseEther("5");
+      const lockAmount = ethers.parseEther("3");
+
+      await stakePool.connect(alice).deposit({ value: depositAmount });
+      await stakePool.lockTokensForStake(alice.address, lockAmount);
+
       await stakePool.unlockTokens(alice.address, lockAmount);
 
       const locked = await stakePool.getLockedBalance(alice.address);
       expect(locked).to.equal(0);
     });
 
-    it("Should claim rewards", async () => {
+    it("Should not allow locking more than balance", async () => {
+      const depositAmount = ethers.parseEther("5");
+      const lockAmount = ethers.parseEther("10");
+
+      await stakePool.connect(alice).deposit({ value: depositAmount });
+
+      await expect(
+        stakePool.lockTokensForStake(alice.address, lockAmount)
+      ).to.be.revertedWith("Insufficient balance");
+    });
+  });
+
+  describe("StakePool - Rewards & Penalties", () => {
+    it("Should claim rewards for correct stakes", async () => {
       const depositAmount = ethers.parseEther("100");
       const stakedAmount = ethers.parseEther("10");
 
       await stakePool.connect(alice).deposit({ value: depositAmount });
-
-      // Mock reward claim (normally called by registry)
       await stakePool.claimRewards(alice.address, stakedAmount);
 
       const balance = await stakePool.getBalance(alice.address);
@@ -239,45 +306,167 @@ describe("VeriChain", () => {
       expect(balance).to.equal(depositAmount + expectedReward);
     });
 
-    it("Should apply penalty", async () => {
+    it("Should apply penalties for incorrect stakes", async () => {
       const depositAmount = ethers.parseEther("100");
       const stakedAmount = ethers.parseEther("10");
 
       await stakePool.connect(alice).deposit({ value: depositAmount });
-
-      // Mock penalty application (normally called by registry)
       await stakePool.applyPenalty(alice.address, stakedAmount);
 
       const balance = await stakePool.getBalance(alice.address);
       const expectedPenalty = (stakedAmount * BigInt(5)) / BigInt(100); // 5% penalty
       expect(balance).to.equal(depositAmount - expectedPenalty);
     });
+
+    it("Should handle multiple reward claims", async () => {
+      const depositAmount = ethers.parseEther("100");
+      const stake1 = ethers.parseEther("10");
+      const stake2 = ethers.parseEther("20");
+
+      await stakePool.connect(alice).deposit({ value: depositAmount });
+      await stakePool.claimRewards(alice.address, stake1);
+      await stakePool.claimRewards(alice.address, stake2);
+
+      const balance = await stakePool.getBalance(alice.address);
+      const totalReward = (stake1 + stake2) / BigInt(10);
+      expect(balance).to.equal(depositAmount + totalReward);
+    });
   });
 
-  describe("Integration Tests", () => {
-    it("End-to-end: Submit claim -> Stake -> Finalize -> Reward", async () => {
-      // 1. Submit claim
-      await registry.submitFactCheck("Test claim", "AI analysis", 85);
+  describe("Integration Tests - Complete Workflow", () => {
+    it("End-to-end: Multi-user voting scenario", async () => {
+      // 1. Alice submits claim
+      await registry.connect(alice).submitFactCheck(
+        "Bitcoin was created in 2009",
+        "Verified through multiple blockchain sources",
+        92
+      );
 
-      // 2. Users deposit to stakepool
-      await stakePool.connect(alice).deposit({ value: ethers.parseEther("20") });
-      await stakePool.connect(bob).deposit({ value: ethers.parseEther("15") });
+      // 2. Bob and Charlie deposit to pool
+      await stakePool.connect(bob).deposit({ value: ethers.parseEther("20") });
+      await stakePool.connect(charlie).deposit({ value: ethers.parseEther("15") });
 
-      // 3. Users stake
-      await registry.connect(alice).addStake(0, true, ethers.parseEther("10"));
-      await registry.connect(bob).addStake(0, false, ethers.parseEther("5"));
+      // 3. Bob stakes for TRUE
+      await registry.connect(bob).addStake(0, true, ethers.parseEther("10"));
 
-      // 4. Finalize (should be TRUE: AI 85% confident + community votes TRUE)
+      // 4. Charlie stakes for FALSE (disputes)
+      await registry.connect(charlie).addStake(0, false, ethers.parseEther("5"));
+
+      // 5. Bob adds another stake to support
+      await registry.connect(bob).addStake(0, true, ethers.parseEther("7"));
+
+      // 6. Verify stakes
+      const factCheck = await registry.getFactCheck(0);
+      expect(factCheck.stakesFor).to.equal(ethers.parseEther("17")); // 10 + 7
+      expect(factCheck.stakesAgainst).to.equal(ethers.parseEther("5"));
+
+      // 7. Finalize verdict (should be TRUE: AI 92% + community 17 > 5)
       await registry.finalizeVerdict(0);
 
-      const factCheck = await registry.getFactCheck(0);
-      expect(factCheck.verdict).to.equal(1); // TRUE
+      const finalCheck = await registry.getFactCheck(0);
+      expect(finalCheck.verdict).to.equal(1); // TRUE
+      expect(finalCheck.finalized).to.be.true;
 
-      // 5. Verify stakes
+      console.log("✅ Multi-user voting scenario complete!");
+    });
+
+    it("Should handle multiple claims with different outcomes", async () => {
+      // Claim 1: Bitcoin 2009
+      await registry.connect(alice).submitFactCheck("Bitcoin 2009", "Analysis", 92);
+
+      // Claim 2: Ethereum PoW (FALSE)
+      await registry.connect(bob).submitFactCheck("Ethereum uses PoW", "Analysis", 30);
+
+      // Stakes on Claim 1 (TRUE)
+      await registry.connect(bob).addStake(0, true, ethers.parseEther("100"));
+      await registry.connect(charlie).addStake(0, false, ethers.parseEther("10"));
+
+      // Stakes on Claim 2 (FALSE)
+      await registry.connect(alice).addStake(1, true, ethers.parseEther("10"));
+      await registry.connect(charlie).addStake(1, false, ethers.parseEther("100"));
+
+      // Finalize both
+      await registry.finalizeVerdict(0);
+      await registry.finalizeVerdict(1);
+
+      const claim1 = await registry.getFactCheck(0);
+      const claim2 = await registry.getFactCheck(1);
+
+      expect(claim1.verdict).to.equal(1); // TRUE
+      expect(claim2.verdict).to.equal(2); // FALSE
+
+      console.log("✅ Multiple claims with different outcomes verified!");
+    });
+
+    it("Should prevent creator from manipulating votes", async () => {
+      // Alice submits claim
+      await registry.connect(alice).submitFactCheck("Claim", "Analysis", 50);
+
+      // Alice tries to stake on her own claim - fails
+      await expect(
+        registry.connect(alice).addStake(0, true, ethers.parseEther("1000"))
+      ).to.be.revertedWith("Cannot stake on your own claim");
+
+      // Only Bob and Charlie can vote
+      await registry.connect(bob).addStake(0, true, ethers.parseEther("10"));
+      await registry.connect(charlie).addStake(0, false, ethers.parseEther("5"));
+
+      const factCheck = await registry.getFactCheck(0);
       expect(factCheck.stakesFor).to.equal(ethers.parseEther("10"));
       expect(factCheck.stakesAgainst).to.equal(ethers.parseEther("5"));
 
-      console.log("✅ Full workflow successful!");
+      console.log("✅ Anti-manipulation protection verified!");
+    });
+  });
+
+  describe("Edge Cases & Security", () => {
+    it("Should handle very high confidence scores", async () => {
+      await registry.submitFactCheck("Claim", "Analysis", 100);
+
+      const factCheck = await registry.getFactCheck(0);
+      expect(factCheck.confidenceScore).to.equal(100);
+    });
+
+    it("Should handle very low confidence scores", async () => {
+      await registry.submitFactCheck("Claim", "Analysis", 0);
+
+      const factCheck = await registry.getFactCheck(0);
+      expect(factCheck.confidenceScore).to.equal(0);
+    });
+
+    it("Should handle large stake amounts", async () => {
+      await registry.connect(alice).submitFactCheck("Claim", "Analysis", 80);
+
+      const largeStake = ethers.parseEther("1000000");
+      await registry.connect(bob).addStake(0, true, largeStake);
+
+      const factCheck = await registry.getFactCheck(0);
+      expect(factCheck.stakesFor).to.equal(largeStake);
+    });
+
+    it("Should track stake count correctly", async () => {
+      await registry.connect(alice).submitFactCheck("Claim", "Analysis", 50);
+
+      await registry.connect(bob).addStake(0, true, ethers.parseEther("1"));
+      await registry.connect(charlie).addStake(0, false, ethers.parseEther("1"));
+      await registry.connect(owner).addStake(0, true, ethers.parseEther("1"));
+
+      const stakesCount = await registry.getStakesCount(0);
+      expect(stakesCount).to.equal(3);
+    });
+
+    it("Should return 0 for getTotalFactChecks when empty", async () => {
+      const count = await registry.getTotalFactChecks();
+      expect(count).to.equal(0);
+    });
+
+    it("Should return correct getTotalFactChecks after submissions", async () => {
+      await registry.connect(alice).submitFactCheck("Claim 1", "Analysis", 50);
+      await registry.connect(bob).submitFactCheck("Claim 2", "Analysis", 75);
+      await registry.connect(charlie).submitFactCheck("Claim 3", "Analysis", 90);
+
+      const count = await registry.getTotalFactChecks();
+      expect(count).to.equal(3);
     });
   });
 });
