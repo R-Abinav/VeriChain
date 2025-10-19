@@ -1,0 +1,26 @@
+# Environment variables
+.env
+.env.local
+
+# Hardhat files
+cache/
+artifacts/
+typechain-types/
+
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
+
+# Logs
+*.log
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
