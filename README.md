@@ -419,6 +419,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🔗 Links
 
+- **Live Demo**: [veri-chain-eight.vercel.app](https://veri-chain-eight.vercel.app)
+- **Backend API**: [verichain-gwmq.onrender.com](https://verichain-gwmq.onrender.com)
+- **Devfolio Project**: [VeriChain on Devfolio](https://devfolio.co/projects/verichain-d005)
 - **Presentation**: https://www.canva.com/design/DAG2DtXAqic/4J_Ia01bA7rJYezofOWLXA/edit
 
 ## 🙏 Acknowledgments
