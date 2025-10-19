@@ -80,6 +80,49 @@ export default function VeriChain() {
   const [stakeSupport, setStakeSupport] = useState(true);
   const [stakingInProgress, setStakingInProgress] = useState(false);
 
+  // Fetch claims from smart contract
+  const loadClaimsFromBlockchain = async () => {
+    if (!registryContract) return;
+
+    try {
+      const totalClaims = await registryContract.getTotalFactChecks();
+      const claims: FactCheck[] = [];
+
+      for (let i = 0; i < Number(totalClaims); i++) {
+        const factCheck = await registryContract.getFactCheck(i);
+        const stakes = await registryContract.getStakes(i);
+
+        claims.push({
+          id: factCheck.id.toString(),
+          claim: factCheck.claim,
+          submittedBy: factCheck.submittedBy,
+          timestamp: new Date(Number(factCheck.timestamp) * 1000).toLocaleTimeString(),
+          analysis: {
+            verdict: ['PENDING', 'TRUE', 'FALSE', 'UNCLEAR'][Number(factCheck.verdict)] as 'TRUE' | 'FALSE' | 'UNCLEAR',
+            confidence: Number(factCheck.confidenceScore),
+            analysis: factCheck.aiAnalysis,
+            sources: []
+          },
+          stakesFor: Number(ethers.formatEther(factCheck.stakesFor)),
+          stakesAgainst: Number(ethers.formatEther(factCheck.stakesAgainst)),
+          totalStakers: stakes.length,
+          status: 'analyzed'
+        });
+      }
+
+      setClaimsList(claims);
+    } catch (err) {
+      console.error('Error loading claims:', err);
+    }
+  };
+
+  // Load claims after wallet connects and contract is set
+  useEffect(() => {
+    if (registryContract && walletConnected) {
+      loadClaimsFromBlockchain();
+    }
+  }, [registryContract, walletConnected]);
+
   // Connect Wallet with Ethers
   const connectWallet = async () => {
     try {
@@ -173,19 +216,8 @@ export default function VeriChain() {
       const receipt = await tx.wait();
       console.log('Claim submitted to blockchain:', receipt);
 
-      const newClaim: FactCheck = {
-        id: Date.now().toString(),
-        claim: claim.trim(),
-        submittedBy: userAddress,
-        timestamp: 'just now',
-        analysis: data.data,
-        stakesFor: 0,
-        stakesAgainst: 0,
-        totalStakers: 0,
-        status: 'analyzed'
-      };
-
-      setClaimsList([newClaim, ...claimsList]);
+      // Refresh list from blockchain after successful submission
+      await loadClaimsFromBlockchain();
       setClaim('');
       setCurrentView('voting');
     } catch (err: any) {
@@ -334,10 +366,13 @@ export default function VeriChain() {
                 </button>
                 <button
                   onClick={disconnectWallet}
-                  className="flex items-center gap-2 bg-gradient-to-r from-purple-600 to-blue-600 hover:from-purple-700 hover:to-blue-700 px-4 py-2 rounded-lg font-semibold transition-all duration-200"
+                  className="relative group flex items-center justify-center gap-2 min-w-48 bg-gradient-to-r from-purple-600 to-blue-600 hover:from-purple-700 hover:to-blue-700 px-5 py-2 rounded-lg font-semibold transition-all duration-200"
                 >
-                  <Wallet className="w-4 h-4" />
-                  {userAddress.slice(0, 6)}...{userAddress.slice(-4)}
+                  <span className="group-hover:hidden inline-flex items-center gap-2">
+                    <Wallet className="w-4 h-4" />
+                    {userAddress.slice(0, 6)}...{userAddress.slice(-4)}
+                  </span>
+                  <span className="hidden group-hover:inline text-rose-300">Disconnect Wallet</span>
                 </button>
               </div>
             ) : null}
@@ -382,7 +417,7 @@ export default function VeriChain() {
                   Submit Claim
                 </button>
                 <button
-                  onClick={() => window.location.reload()}
+                  onClick={loadClaimsFromBlockchain}
                   className="px-6 py-3 bg-slate-700 hover:bg-slate-600 rounded-xl font-semibold transition-all duration-200"
                   aria-label="Refresh to see latest claims"
                   title="Refresh to see latest claims"
