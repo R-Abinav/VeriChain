@@ -26,6 +26,8 @@ if (import.meta.env.DEV) {
 const FACT_CHECK_REGISTRY_ABI = [
   'function submitFactCheck(string memory _claim, string memory _aiAnalysis, uint8 _confidenceScore) external returns (uint256)',
   'function addStake(uint256 _id, bool _supportVerdict, uint256 _amount) external',
+  'function finalizeVerdict(uint256 _id) external',
+  'function owner() external view returns (address)',
   'function getFactCheck(uint256 _id) external view returns (tuple(uint256 id, string claim, string aiAnalysis, uint8 confidenceScore, uint8 verdict, address submittedBy, uint256 timestamp, uint256 stakesFor, uint256 stakesAgainst, bool finalized))',
   'function getTotalFactChecks() external view returns (uint256)',
   'function getStakes(uint256 _id) external view returns (tuple(address staker, uint256 amount, bool supportVerdict, uint256 timestamp)[])',
@@ -34,8 +36,11 @@ const FACT_CHECK_REGISTRY_ABI = [
 const STAKE_POOL_ABI = [
   'function deposit() external payable',
   'function withdraw(uint256 _amount) external',
+  'function lockTokensForStake(address _user, uint256 _amount) external',
+  'function unlockTokens(address _user, uint256 _amount) external',
   'function getBalance(address _user) external view returns (uint256)',
   'function getAvailableBalance(address _user) external view returns (uint256)',
+  'function getLockedBalance(address _user) external view returns (uint256)',
 ];
 
 interface AnalysisResult {
@@ -58,7 +63,9 @@ interface FactCheck {
     amount: number;
     supportVerdict: boolean;
   };
-  status: 'pending' | 'analyzed' | 'finalized';
+  status: 'pending' | 'analyzing' | 'analyzed' | 'finalized';
+  aiAnalysisStatus: 'pending' | 'analyzing' | 'completed';
+  finalVerdict?: 'TRUE' | 'FALSE' | 'UNCLEAR';
 }
 
 export default function VeriChain() {
@@ -70,6 +77,7 @@ export default function VeriChain() {
   const [signer, setSigner] = useState<ethers.Signer | null>(null);
   const [registryContract, setRegistryContract] = useState<ethers.Contract | null>(null);
   const [stakePoolContract, setStakePoolContract] = useState<ethers.Contract | null>(null);
+  const [isContractOwner, setIsContractOwner] = useState(false);
   
   const [claimsList, setClaimsList] = useState<FactCheck[]>([]);
   const [claim, setClaim] = useState('');
@@ -92,13 +100,16 @@ export default function VeriChain() {
         const factCheck = await registryContract.getFactCheck(i);
         const stakes = await registryContract.getStakes(i);
 
+        const verdict = Number(factCheck.verdict);
+        const isFinalized = factCheck.finalized;
+        
         claims.push({
           id: factCheck.id.toString(),
           claim: factCheck.claim,
           submittedBy: factCheck.submittedBy,
           timestamp: new Date(Number(factCheck.timestamp) * 1000).toLocaleTimeString(),
           analysis: {
-            verdict: ['PENDING', 'TRUE', 'FALSE', 'UNCLEAR'][Number(factCheck.verdict)] as 'TRUE' | 'FALSE' | 'UNCLEAR',
+            verdict: ['PENDING', 'TRUE', 'FALSE', 'UNCLEAR'][verdict] as 'TRUE' | 'FALSE' | 'UNCLEAR',
             confidence: Number(factCheck.confidenceScore),
             analysis: factCheck.aiAnalysis,
             sources: []
@@ -106,13 +117,38 @@ export default function VeriChain() {
           stakesFor: Number(ethers.formatEther(factCheck.stakesFor)),
           stakesAgainst: Number(ethers.formatEther(factCheck.stakesAgainst)),
           totalStakers: stakes.length,
-          status: 'analyzed'
+          status: isFinalized ? 'finalized' : 'analyzed',
+          aiAnalysisStatus: 'completed',
+          finalVerdict: isFinalized ? ['PENDING', 'TRUE', 'FALSE', 'UNCLEAR'][verdict] as 'TRUE' | 'FALSE' | 'UNCLEAR' : undefined
         });
       }
 
       setClaimsList(claims);
+      
+      // Also refresh user balance
+      if (stakePoolContract && userAddress) {
+        try {
+          const balance = await stakePoolContract.getAvailableBalance(userAddress);
+          setUserBalance(ethers.formatEther(balance));
+        } catch (e) {
+          console.log('Could not refresh balance');
+        }
+      }
     } catch (err) {
       console.error('Error loading claims:', err);
+    }
+  };
+
+  // Check if user is contract owner
+  const checkContractOwner = async () => {
+    if (!registryContract || !userAddress) return;
+    
+    try {
+      const owner = await registryContract.owner();
+      setIsContractOwner(owner.toLowerCase() === userAddress.toLowerCase());
+    } catch (err) {
+      console.log('Could not check contract owner');
+      setIsContractOwner(false);
     }
   };
 
@@ -120,8 +156,9 @@ export default function VeriChain() {
   useEffect(() => {
     if (registryContract && walletConnected) {
       loadClaimsFromBlockchain();
+      checkContractOwner();
     }
-  }, [registryContract, walletConnected]);
+  }, [registryContract, walletConnected, userAddress]);
 
   // Connect Wallet with Ethers
   const connectWallet = async () => {
@@ -156,12 +193,13 @@ export default function VeriChain() {
       setWalletConnected(true);
       setCurrentView('voting');
 
-      // Fetch user balance
+      // Fetch balance from StakePool (not wallet balance)
       try {
         const balance = await stakePool.getAvailableBalance(address);
         setUserBalance(ethers.formatEther(balance));
       } catch (e) {
-        console.log('Could not fetch balance - contracts may not be deployed');
+        console.log('Could not fetch stake pool balance, setting to 0');
+        setUserBalance('0');
       }
 
       setError('');
@@ -196,6 +234,21 @@ export default function VeriChain() {
     setError('');
 
     try {
+      // Add a temporary claim with analyzing status
+      const tempClaim: FactCheck = {
+        id: 'temp-' + Date.now(),
+        claim: claim.trim(),
+        submittedBy: userAddress,
+        timestamp: new Date().toLocaleTimeString(),
+        stakesFor: 0,
+        stakesAgainst: 0,
+        totalStakers: 0,
+        status: 'analyzing',
+        aiAnalysisStatus: 'analyzing'
+      };
+      
+      setClaimsList(prev => [tempClaim, ...prev]);
+
       // 1. Get AI Analysis
       const response = await fetch(`${API_URL}/analyze`, {
         method: 'POST',
@@ -223,13 +276,15 @@ export default function VeriChain() {
     } catch (err: any) {
       setError(`Error: ${err.message || 'Failed to submit claim'}`);
       console.error(err);
+      // Remove temp claim on error
+      setClaimsList(prev => prev.filter(c => !c.id.startsWith('temp-')));
     } finally {
       setLoading(false);
     }
   };
 
   // Stake on Claim via Smart Contract
-  const handleStake = async (checkId: string) => {
+  const handleStake = async (checkId: string, supportVerdict: boolean) => {
     const check = claimsList.find(c => c.id === checkId);
     if (!check) return;
 
@@ -243,7 +298,7 @@ export default function VeriChain() {
       return;
     }
 
-    if (!registryContract || !signer) {
+    if (!registryContract || !stakePoolContract || !signer) {
       setError('Contracts not initialized or wallet not connected');
       return;
     }
@@ -254,16 +309,27 @@ export default function VeriChain() {
     try {
       const stakeAmountWei = ethers.parseEther(stakeAmount);
 
-      // Call addStake on FactCheckRegistry
-      // Note: The user must have already deposited to StakePool
-      const tx = await registryContract.addStake(
+      // First, check if user has enough balance in StakePool
+      const availableBalance = await stakePoolContract.getAvailableBalance(userAddress);
+      if (availableBalance < stakeAmountWei) {
+        setError(`Insufficient balance. You have ${ethers.formatEther(availableBalance)} ETH available. Please deposit more ETH to the stake pool first.`);
+        return;
+      }
+
+      // Step 1: Lock tokens in StakePool
+      const lockTx = await stakePoolContract.lockTokensForStake(userAddress, stakeAmountWei);
+      await lockTx.wait();
+      console.log('Tokens locked in StakePool');
+
+      // Step 2: Add stake to FactCheckRegistry
+      const stakeTx = await registryContract.addStake(
         BigInt(checkId),
-        stakeSupport,
+        supportVerdict,
         stakeAmountWei
       );
 
       // Wait for confirmation
-      const receipt = await tx.wait();
+      const receipt = await stakeTx.wait();
       console.log('Stake confirmed on blockchain:', receipt);
 
       // Update UI
@@ -273,15 +339,25 @@ export default function VeriChain() {
             const amount = Number(stakeAmount);
             return {
               ...c,
-              stakesFor: stakeSupport ? c.stakesFor + amount : c.stakesFor,
-              stakesAgainst: !stakeSupport ? c.stakesAgainst + amount : c.stakesAgainst,
+              stakesFor: supportVerdict ? c.stakesFor + amount : c.stakesFor,
+              stakesAgainst: !supportVerdict ? c.stakesAgainst + amount : c.stakesAgainst,
               totalStakers: c.totalStakers + 1,
-              userStake: { amount, supportVerdict: stakeSupport }
+              userStake: { amount, supportVerdict }
             };
           }
           return c;
         })
       );
+
+      // Refresh balance after staking
+      if (stakePoolContract && userAddress) {
+        try {
+          const balance = await stakePoolContract.getAvailableBalance(userAddress);
+          setUserBalance(ethers.formatEther(balance));
+        } catch (e) {
+          console.log('Could not refresh balance after staking');
+        }
+      }
 
       setStakeAmount('');
       setSelectedForStaking(null);
@@ -304,11 +380,25 @@ export default function VeriChain() {
     if (!depositAmount || isNaN(Number(depositAmount))) return;
 
     setLoading(true);
+    setError('');
+    
     try {
+      const depositAmountWei = ethers.parseEther(depositAmount);
+      
+      // Check wallet balance first
+      const walletBalance = await signer.provider!.getBalance(userAddress);
+      if (walletBalance < depositAmountWei) {
+        setError(`Insufficient wallet balance. You have ${ethers.formatEther(walletBalance)} ETH in your wallet.`);
+        return;
+      }
+
       const tx = await stakePoolContract.deposit({
-        value: ethers.parseEther(depositAmount)
+        value: depositAmountWei
       });
-      await tx.wait();
+      
+      console.log('Deposit transaction sent:', tx.hash);
+      const receipt = await tx.wait();
+      console.log('Deposit confirmed:', receipt);
       
       // Update balance
       const newBalance = await stakePoolContract.getAvailableBalance(userAddress);
@@ -317,6 +407,32 @@ export default function VeriChain() {
       setError('');
     } catch (err: any) {
       setError(`Deposit failed: ${err.message}`);
+      console.error('Deposit error:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Finalize verdict function
+  const finalizeVerdict = async (checkId: string) => {
+    if (!registryContract || !signer) {
+      setError('Contracts not initialized');
+      return;
+    }
+
+    setLoading(true);
+    setError('');
+
+    try {
+      const tx = await registryContract.finalizeVerdict(BigInt(checkId));
+      await tx.wait();
+      
+      // Refresh the claims list to show updated verdict
+      await loadClaimsFromBlockchain();
+      setError('');
+    } catch (err: any) {
+      setError(`Failed to finalize verdict: ${err.message}`);
+      console.error(err);
     } finally {
       setLoading(false);
     }
@@ -328,10 +444,21 @@ export default function VeriChain() {
     return <HelpCircle className="w-6 h-6 text-amber-400" />;
   };
 
-  const getVerdictBg = (verdict: string) => {
-    if (verdict === 'TRUE') return 'from-emerald-500/20 to-emerald-600/20 border-emerald-500/30';
-    if (verdict === 'FALSE') return 'from-rose-500/20 to-rose-600/20 border-rose-500/30';
-    return 'from-amber-500/20 to-amber-600/20 border-amber-500/30';
+  const getClaimBg = (claim: FactCheck) => {
+    // If finalized, use the final verdict color
+    if (claim.status === 'finalized' && claim.finalVerdict) {
+      if (claim.finalVerdict === 'TRUE') return 'from-emerald-500/20 to-emerald-600/20 border-emerald-500/30';
+      if (claim.finalVerdict === 'FALSE') return 'from-rose-500/20 to-rose-600/20 border-rose-500/30';
+      return 'from-amber-500/20 to-amber-600/20 border-amber-500/30';
+    }
+    
+    // If analyzing, show yellow
+    if (claim.aiAnalysisStatus === 'analyzing') {
+      return 'from-yellow-500/20 to-yellow-600/20 border-yellow-500/30';
+    }
+    
+    // Default to yellow for pending/analyzed but not finalized
+    return 'from-yellow-500/20 to-yellow-600/20 border-yellow-500/30';
   };
 
   return (
@@ -355,13 +482,14 @@ export default function VeriChain() {
             {walletConnected ? (
               <div className="flex items-center gap-4">
                 <div className="text-right">
-                  <p className="text-sm text-slate-400">Balance</p>
+                  <p className="text-sm text-slate-400">Stake Pool Balance</p>
                   <p className="font-bold text-emerald-400">{parseFloat(userBalance).toFixed(4)} ETH</p>
                 </div>
                 <button
                   onClick={handleDepositToPool}
-                  className="px-3 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm font-semibold transition-all duration-200"
+                  className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg font-semibold transition-all duration-200 flex items-center gap-2"
                 >
+                  <Plus className="w-4 h-4" />
                   Deposit
                 </button>
                 <button
@@ -439,34 +567,37 @@ export default function VeriChain() {
                   </div>
                 ) : (
                   claimsList.map((claim) => (
-                    <div key={claim.id} className={`bg-gradient-to-br ${getVerdictBg(claim.analysis?.verdict || 'UNCLEAR')} border rounded-2xl p-6 backdrop-blur-sm transition-all duration-300 hover:shadow-xl`}>
+                    <div key={claim.id} className={`bg-gradient-to-br ${getClaimBg(claim)} border rounded-2xl p-6 backdrop-blur-sm transition-all duration-300 hover:shadow-xl`}>
                       <div className="flex items-start justify-between mb-4">
                         <div className="flex-1">
                           <div className="flex items-center gap-2 mb-2">
-                            {claim.analysis && getVerdictIcon(claim.analysis.verdict)}
-                            <span className="text-sm text-slate-400">{claim.timestamp}</span>
+                            {claim.aiAnalysisStatus === 'analyzing' ? (
+                              <div className="flex items-center gap-2">
+                                <Loader className="w-4 h-4 animate-spin text-yellow-400" />
+                                <span className="text-sm text-yellow-400">AI Analyzing...</span>
+                              </div>
+                            ) : claim.aiAnalysisStatus === 'completed' ? (
+                              <div className="flex items-center gap-2">
+                                <CheckCircle className="w-4 h-4 text-green-400" />
+                                <span className="text-sm text-green-400">AI Analysis Done</span>
+                              </div>
+                            ) : (
+                              <div className="flex items-center gap-2">
+                                {claim.finalVerdict && getVerdictIcon(claim.finalVerdict)}
+                                <span className="text-sm text-slate-400">{claim.timestamp}</span>
+                              </div>
+                            )}
                           </div>
                           <h3 className="text-xl font-bold text-white mb-2">{claim.claim}</h3>
                           <p className="text-sm text-slate-400">Posted by {claim.submittedBy}</p>
                         </div>
-                        {claim.analysis && (
+                        {claim.status === 'finalized' && claim.finalVerdict && (
                           <div className="text-right">
-                            <div className="text-3xl font-black text-purple-400">{claim.analysis.verdict}</div>
-                            <div className="text-sm text-slate-400">{claim.analysis.confidence}%</div>
+                            <div className="text-3xl font-black text-purple-400">{claim.finalVerdict}</div>
+                            <div className="text-sm text-slate-400">Final Result</div>
                           </div>
                         )}
                       </div>
-
-                      {claim.analysis && (
-                        <div className="bg-slate-900/50 border border-slate-700/50 rounded-xl p-4 mb-4">
-                          <p className="text-sm text-slate-300"><strong>🤖 AI:</strong> {claim.analysis.analysis}</p>
-                          <div className="flex gap-2 mt-3 flex-wrap">
-                            {claim.analysis.sources.map((s, i) => (
-                              <span key={i} className="text-xs bg-slate-800 px-2 py-1 rounded text-slate-300">{s}</span>
-                            ))}
-                          </div>
-                        </div>
-                      )}
 
                       <div className="grid grid-cols-3 gap-3 mb-4">
                         <div className="bg-emerald-500/20 border border-emerald-500/30 rounded-lg p-3">
@@ -490,58 +621,89 @@ export default function VeriChain() {
                       )}
 
                       {claim.submittedBy !== userAddress ? (
-                        selectedForStaking === claim.id ? (
-                          <div className="space-y-3">
-                            <input
-                              type="number"
-                              value={stakeAmount}
-                              onChange={(e) => setStakeAmount(e.target.value)}
-                              placeholder="Amount (ETH)"
-                              className="w-full bg-slate-900/50 border border-slate-700/50 rounded-lg px-3 py-2 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-purple-500"
-                            />
+                        // Only show staking options if claim is not finalized
+                        claim.status !== 'finalized' ? (
+                          selectedForStaking === claim.id ? (
+                            <div className="space-y-3">
+                              <input
+                                type="number"
+                                value={stakeAmount}
+                                onChange={(e) => setStakeAmount(e.target.value)}
+                                placeholder="Amount (ETH)"
+                                className="w-full bg-slate-900/50 border border-slate-700/50 rounded-lg px-3 py-2 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                              />
+                              <div className="flex gap-2">
+                                <button
+                                  onClick={() => handleStake(claim.id, true)}
+                                  disabled={stakingInProgress}
+                                  className="flex-1 bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-600 px-3 py-2 rounded-lg text-sm font-semibold transition-all duration-200 flex items-center justify-center gap-2"
+                                >
+                                  {stakingInProgress ? <Loader className="w-4 h-4 animate-spin" /> : '✅'}
+                                  Support
+                                </button>
+                                <button
+                                  onClick={() => handleStake(claim.id, false)}
+                                  disabled={stakingInProgress}
+                                  className="flex-1 bg-rose-600 hover:bg-rose-700 disabled:bg-slate-600 px-3 py-2 rounded-lg text-sm font-semibold transition-all duration-200 flex items-center justify-center gap-2"
+                                >
+                                  {stakingInProgress ? <Loader className="w-4 h-4 animate-spin" /> : '❌'}
+                                  Dispute
+                                </button>
+                                <button
+                                  onClick={() => setSelectedForStaking(null)}
+                                  disabled={stakingInProgress}
+                                  className="flex-1 bg-slate-700 hover:bg-slate-600 disabled:bg-slate-600 px-3 py-2 rounded-lg text-sm font-semibold transition-all duration-200"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
                             <div className="flex gap-2">
                               <button
-                                onClick={() => {
-                                  setStakeSupport(true);
-                                  handleStake(claim.id);
-                                }}
-                                disabled={stakingInProgress}
-                                className="flex-1 bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-600 px-3 py-2 rounded-lg text-sm font-semibold transition-all duration-200 flex items-center justify-center gap-2"
+                                onClick={() => setSelectedForStaking(claim.id)}
+                                className="flex-1 bg-slate-700 hover:bg-slate-600 px-4 py-2 rounded-lg font-semibold transition-all duration-200"
                               >
-                                {stakingInProgress ? <Loader className="w-4 h-4 animate-spin" /> : '✅'}
-                                Support
+                                {claim.userStake ? 'Stake More' : 'Add Your Stake'}
                               </button>
-                              <button
-                                onClick={() => {
-                                  setStakeSupport(false);
-                                  handleStake(claim.id);
-                                }}
-                                disabled={stakingInProgress}
-                                className="flex-1 bg-rose-600 hover:bg-rose-700 disabled:bg-slate-600 px-3 py-2 rounded-lg text-sm font-semibold transition-all duration-200 flex items-center justify-center gap-2"
-                              >
-                                {stakingInProgress ? <Loader className="w-4 h-4 animate-spin" /> : '❌'}
-                                Dispute
-                              </button>
-                              <button
-                                onClick={() => setSelectedForStaking(null)}
-                                disabled={stakingInProgress}
-                                className="flex-1 bg-slate-700 hover:bg-slate-600 disabled:bg-slate-600 px-3 py-2 rounded-lg text-sm font-semibold transition-all duration-200"
-                              >
-                                Cancel
-                              </button>
+                              {isContractOwner && claim.status === 'analyzed' && claim.stakesFor + claim.stakesAgainst > 0 && (
+                                <button
+                                  onClick={() => finalizeVerdict(claim.id)}
+                                  disabled={loading}
+                                  className="px-4 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-slate-600 rounded-lg font-semibold transition-all duration-200 flex items-center justify-center gap-2"
+                                >
+                                  {loading ? <Loader className="w-4 h-4 animate-spin" /> : '🏁'}
+                                  Finalize
+                                </button>
+                              )}
                             </div>
-                          </div>
+                          )
                         ) : (
-                          <button
-                            onClick={() => setSelectedForStaking(claim.id)}
-                            className="w-full bg-slate-700 hover:bg-slate-600 px-4 py-2 rounded-lg font-semibold transition-all duration-200"
-                          >
-                            Add Your Stake
-                          </button>
+                          // Show finalized message when claim is finalized
+                          <div className="bg-slate-800/50 border border-slate-700/50 rounded-lg p-3 text-center">
+                            <p className="text-sm text-slate-400">🏁 Claim Finalized - No More Staking</p>
+                            <p className="text-xs text-slate-500 mt-1">This claim has reached a final verdict</p>
+                          </div>
                         )
                       ) : (
                         <div className="bg-slate-800/50 border border-slate-700/50 rounded-lg p-3 text-center">
                           <p className="text-sm text-slate-400">👤 This is your claim</p>
+                          {isContractOwner && claim.status === 'analyzed' && claim.stakesFor + claim.stakesAgainst > 0 && (
+                            <button
+                              onClick={() => finalizeVerdict(claim.id)}
+                              disabled={loading}
+                              className="mt-2 px-4 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-slate-600 rounded-lg font-semibold transition-all duration-200 flex items-center justify-center gap-2 mx-auto"
+                            >
+                              {loading ? <Loader className="w-4 h-4 animate-spin" /> : '🏁'}
+                              Finalize
+                            </button>
+                          )}
+                          {claim.status === 'finalized' && (
+                            <p className="text-xs text-slate-500 mt-1">Your claim has been finalized</p>
+                          )}
+                          {!isContractOwner && claim.status === 'analyzed' && (
+                            <p className="text-xs text-slate-500 mt-1">Waiting for contract owner to finalize</p>
+                          )}
                         </div>
                       )}
                     </div>
