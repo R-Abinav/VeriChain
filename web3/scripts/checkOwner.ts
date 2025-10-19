@@ -2,10 +2,16 @@ import { ethers } from "ethers";
 import hre from "hardhat";
 
 async function main() {
-  // Replace with your actual contract address
-  const FACT_CHECK_REGISTRY_ADDRESS = "0x8105114191607a4F160561BaF7556E79bEe8E8e2";
+  // Get contract address from environment variable
+  const FACT_CHECK_REGISTRY_ADDRESS = process.env.FACT_CHECK_REGISTRY_ADDRESS;
   
-  // Contract address is set, proceed with checking owner
+  if (!FACT_CHECK_REGISTRY_ADDRESS) {
+    console.error("❌ FACT_CHECK_REGISTRY_ADDRESS environment variable is not set");
+    console.log("💡 Add FACT_CHECK_REGISTRY_ADDRESS=your_contract_address to your .env file");
+    process.exit(1);
+  }
+  
+  console.log("📋 Using contract address:", FACT_CHECK_REGISTRY_ADDRESS);
 
   console.log("🔍 Checking contract owner...");
   
